@@ -9,6 +9,8 @@ const tsconfigRootDir = path.dirname(fileURLToPath(import.meta.url));
 export default tseslint.config(
   {
     ignores: ["coverage/**", "dist/**", "node_modules/**"],
+  },
+  {
     linterOptions: {
       reportUnusedDisableDirectives: "error",
     },

@@ -17,7 +17,7 @@
     "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "noEmit": true,
+    "outDir": "dist",
     "types": ["node"],
     "plugins": [
       {
@@ -25,5 +25,5 @@
       }
     ]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "*.config.ts"]
+  "include": ["src/**/*.ts", "*.config.ts"]
 }

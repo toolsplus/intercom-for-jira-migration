@@ -3,3 +3,5 @@ dist/
 node_modules/
 *.tsbuildinfo
 .idea
+.env
+intercom-for-jira-export*.jsonl.gz
