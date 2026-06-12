@@ -5,8 +5,8 @@
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -16,10 +16,15 @@
     "effect:lsp:patch": "effect-language-service patch"
   },
   "dependencies": {
+    "@effect/platform-node": "4.0.0-beta.78",
     "effect": "4.0.0-beta.78"
+  },
+  "bin": {
+    "ifj": "./dist/src/ifj.js"
   },
   "devDependencies": {
     "@effect/language-service": "^0.86.2",
+    "@effect/vitest": "4.0.0-beta.78",
     "@eslint/js": "^10.0.1",
     "@types/node": "^25.9.1",
     "eslint": "^10.4.1",
