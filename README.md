@@ -4,6 +4,11 @@
 
 ## Requirements
 
+- **Node.js:** Node.js 24 is recommended. Install it from the
+  [official Node.js download page](https://nodejs.org/en/download).
+- **pnpm:** This repository uses pnpm to install dependencies and run scripts.
+  Install it by following the [pnpm installation guide](https://pnpm.io/installation).
+
 ### Source Jira site
 
 - **Administrator user:** This user should have access to all Jira spaces on the source site.
@@ -17,6 +22,26 @@
   - `write:jira-work`
 
 If the user has access to both the source and target sites, you can include both source and target scopes in the same API token and use the same token for both import and export.
+
+## Getting started
+
+To run the CLI from a local clone, follow these steps:
+
+```sh
+git clone <repository-url>
+cd intercom-for-jira-migration
+pnpm install
+pnpm build
+```
+
+After building, run the CLI with Node from the generated `dist` output:
+
+```sh
+node dist/src/ifj.js export --source https://example.atlassian.net --user admin@example.com --api-token "$TOKEN"
+node dist/src/ifj.js inspect intercom-for-jira-export.jsonl.gz
+```
+
+You may use environment variables or a .env file to set command configurations. Refer to the command documentation below for available options. 
 
 ## Commands
 
