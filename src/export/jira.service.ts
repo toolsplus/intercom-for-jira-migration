@@ -1,9 +1,10 @@
 import { Array as Arr, Context, Effect, Layer, Option, Order, Stream } from "effect";
 import { AppError } from "../errors.js";
+import {
+  conversationLinksPropertyKey,
+  spaceConfigurationPropertyKey,
+} from "../shared/app/index.js";
 import { JiraClient, type JiraProjectSpace, type JiraWorkItem } from "../shared/jira/index.js";
-
-export const spaceConfigurationPropertyKey = "intercom.connection.configuration";
-export const conversationLinksPropertyKey = "intercom.conversation.links";
 
 const intercomIntegrationStatusPropertyQuery = "[intercomIntegrationStatus]=true";
 const projectSearchKeyChunkSize = 50;

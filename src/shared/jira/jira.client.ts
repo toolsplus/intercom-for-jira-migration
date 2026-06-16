@@ -1,19 +1,28 @@
 import { Buffer } from "node:buffer";
 import { NodeHttpClient } from "@effect/platform-node";
 import { Context, Effect, Layer, Option, Redacted, Stream } from "effect";
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
+import { Headers, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 
 import { AppError } from "../../errors.js";
 import {
   ApproximateSearchCountRequest,
+  BulkFetchWorkItemsRequest,
+  BulkFetchWorkItemsResponse,
+  BulkIssuePropertiesRequest,
   CountResponse,
   type JiraCredentials,
+  type JiraBulkFetchedWorkItem,
+  type JiraIssuePropertyUpdate,
+  type JiraJsonPropertyValue,
   type JiraPermissions,
   type JiraProjectSpace,
   type JiraSearchProjectSpacesParams,
   type JiraSearchWorkItemsParams,
+  type JiraTaskResponse,
   type JiraWorkItem,
+  JiraTaskResponse as JiraTaskResponseSchema,
   PermissionResponse,
+  ProjectPropertyRequest,
   ProjectSearch,
   SearchResponse,
   SearchWorkItemsRequest,
@@ -35,6 +44,19 @@ export class JiraClient extends Context.Service<
     readonly searchWorkItems: (
       params: JiraSearchWorkItemsParams,
     ) => Stream.Stream<JiraWorkItem, AppError>;
+    readonly writeProjectProperty: (
+      projectKey: string,
+      propertyKey: string,
+      value: JiraJsonPropertyValue,
+    ) => Effect.Effect<void, AppError>;
+    readonly bulkFetchWorkItems: (
+      workItemKeys: readonly string[],
+    ) => Effect.Effect<readonly JiraBulkFetchedWorkItem[], AppError>;
+    readonly submitIssuePropertyBulkTask: (
+      propertyKey: string,
+      propertyUpdates: readonly JiraIssuePropertyUpdate[],
+    ) => Effect.Effect<string, AppError>;
+    readonly getTask: (taskLocation: string) => Effect.Effect<JiraTaskResponse, AppError>;
   }
 >()("ifj/JiraClient") {
   static layerNoDeps(
@@ -44,7 +66,17 @@ export class JiraClient extends Context.Service<
   }
 
   static layer(credentials: JiraCredentials): Layer.Layer<JiraClient> {
-    return JiraClient.layerNoDeps(credentials).pipe(Layer.provide(NodeHttpClient.layerFetch));
+    return JiraClient.layerNoDeps(credentials).pipe(
+      Layer.provide(
+        NodeHttpClient.layerFetch.pipe(
+          Layer.provide(
+            Layer.succeed(NodeHttpClient.RequestInit, {
+              redirect: "manual",
+            }),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -62,7 +94,8 @@ const makeJiraClient = (
       Authorization: authHeader,
       Accept: "application/json",
     };
-    const apiUrl = (path: string): URL => new URL(path, credentials.source);
+    const siteUrl = new URL(credentials.siteUrl);
+    const apiUrl = (path: string): URL => new URL(path, siteUrl);
 
     const getMyPermissions = Effect.fn("JiraClient.getMyPermissions")(function* (
       permissions: readonly string[],
@@ -229,10 +262,161 @@ const makeJiraClient = (
         }),
       );
 
+    const writeProjectProperty = Effect.fn("JiraClient.writeProjectProperty")(function* (
+      projectKey: string,
+      propertyKey: string,
+      value: JiraJsonPropertyValue,
+    ) {
+      const path = `/rest/api/3/project/${encodeURIComponent(projectKey)}/properties/${encodeURIComponent(propertyKey)}`;
+      const context = { method: "PUT", path };
+      const request = yield* HttpClientRequest.put(apiUrl(path), {
+        headers: requestHeaders,
+      }).pipe(
+        HttpClientRequest.schemaBodyJson(ProjectPropertyRequest)(value),
+        Effect.mapError(
+          (cause) =>
+            new AppError("jira.malformed", "Could not encode Jira project property body.", {
+              context,
+              cause,
+            }),
+        ),
+      );
+      yield* sendWithRetry(context, httpClient.execute(request), (response) =>
+        HttpClientResponse.matchStatus(response, {
+          "2xx": () => Effect.void,
+          orElse: (response) => jiraStatusFailure(response, context),
+        }),
+      );
+    });
+
+    const bulkFetchWorkItems = Effect.fn("JiraClient.bulkFetchWorkItems")(function* (
+      workItemKeys: readonly string[],
+    ) {
+      const path = "/rest/api/3/issue/bulkfetch";
+      const context = { method: "POST", path };
+      const request = yield* HttpClientRequest.post(apiUrl(path), {
+        headers: requestHeaders,
+      }).pipe(
+        HttpClientRequest.schemaBodyJson(BulkFetchWorkItemsRequest)({
+          issueIdsOrKeys: workItemKeys,
+          fields: ["key"],
+        }),
+        Effect.mapError(
+          (cause) =>
+            new AppError("jira.malformed", "Could not encode Jira bulk fetch request body.", {
+              context,
+              cause,
+            }),
+        ),
+      );
+      const decoded = yield* sendWithRetry(context, httpClient.execute(request), (response) =>
+        HttpClientResponse.matchStatus(response, {
+          "2xx": (response) =>
+            HttpClientResponse.schemaBodyJson(BulkFetchWorkItemsResponse)(response).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new AppError("jira.malformed", "Jira returned a malformed bulk fetch response.", {
+                    context,
+                    cause,
+                  }),
+              ),
+            ),
+          orElse: (response) => jiraStatusFailure(response, context),
+        }),
+      );
+      return decoded.issues;
+    });
+
+    const submitIssuePropertyBulkTask = Effect.fn("JiraClient.submitIssuePropertyBulkTask")(
+      function* (propertyKey: string, propertyUpdates: readonly JiraIssuePropertyUpdate[]) {
+        const path = "/rest/api/3/issue/properties/multi";
+        const context = { method: "POST", path };
+        const request = yield* HttpClientRequest.post(apiUrl(path), {
+          headers: requestHeaders,
+        }).pipe(
+          HttpClientRequest.schemaBodyJson(BulkIssuePropertiesRequest)({
+            issues: propertyUpdates.map((propertyUpdate) => ({
+              issueID: Number(propertyUpdate.issueId),
+              properties: {
+                [propertyKey]: propertyUpdate.value,
+              },
+            })),
+          }),
+          Effect.mapError(
+            (cause) =>
+              new AppError("jira.malformed", "Could not encode Jira bulk property body.", {
+                context,
+                cause,
+              }),
+          ),
+        );
+        return yield* sendWithRetry(context, httpClient.execute(request), (response) =>
+          HttpClientResponse.matchStatus(response, {
+            303: (response) =>
+              Effect.fromOption(Headers.get(response.headers, "location")).pipe(
+                Effect.mapError(
+                  () =>
+                    new AppError(
+                      "jira.malformed",
+                      "Jira bulk property task response is missing a Location header.",
+                      { context },
+                    ),
+                ),
+              ),
+            orElse: (response) => jiraStatusFailure(response, context),
+          }),
+        );
+      },
+    );
+
+    const getTask = Effect.fn("JiraClient.getTask")(function* (taskLocation: string) {
+      const taskUrl = yield* Effect.try({
+        try: () => new URL(taskLocation, siteUrl),
+        catch: (cause) =>
+          new AppError("jira.malformed", "Jira returned an invalid task location.", {
+            context: { taskLocation },
+            cause,
+          }),
+      });
+      if (taskUrl.origin !== siteUrl.origin) {
+        return yield* new AppError(
+          "jira.malformed",
+          "Jira returned a task location for another site.",
+          {
+            context: { taskLocation },
+          },
+        );
+      }
+      const path = `${taskUrl.pathname}${taskUrl.search}`;
+      const context = { method: "GET", path };
+      return yield* sendWithRetry(
+        context,
+        httpClient.get(taskUrl, { headers: requestHeaders }),
+        (response) =>
+          HttpClientResponse.matchStatus(response, {
+            "2xx": (response) =>
+              HttpClientResponse.schemaBodyJson(JiraTaskResponseSchema)(response).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new AppError("jira.malformed", "Jira returned a malformed task response.", {
+                      context,
+                      cause,
+                    }),
+                ),
+              ),
+            orElse: (response) => jiraStatusFailure(response, context),
+          }),
+      );
+    });
+
     return JiraClient.of({
       getMyPermissions,
       searchProjectSpaces,
       approximateSearchCount,
       searchWorkItems,
+      writeProjectProperty,
+      bulkFetchWorkItems,
+      submitIssuePropertyBulkTask,
+      getTask,
     });
   });

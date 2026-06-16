@@ -315,7 +315,7 @@ export class ExportService extends Context.Service<
         Layer.mergeAll(
           ArtifactWriterService.layer,
           JiraClient.layer({
-            source: config.source,
+            siteUrl: config.source,
             user: config.user,
             apiToken: config.apiToken,
           }),

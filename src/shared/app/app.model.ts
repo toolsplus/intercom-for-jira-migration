@@ -1,5 +1,8 @@
 import { Schema, SchemaGetter, SchemaTransformation } from "effect";
 
+export const spaceConfigurationPropertyKey = "intercom.connection.configuration";
+export const conversationLinksPropertyKey = "intercom.conversation.links";
+
 const ConversationId = Schema.String.pipe(
   Schema.decode(SchemaTransformation.trim()),
   Schema.check(Schema.isNonEmpty()),

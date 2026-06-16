@@ -7,13 +7,13 @@ import { TestConsole } from "effect/testing";
 import { describe, expect, it } from "@effect/vitest";
 
 import { InspectService } from "../inspect/index.js";
-import { JiraClient } from "../shared/jira/index.js";
-import { type ArtifactRecord, ArtifactWriterService } from "../shared/artifact/index.js";
 import {
   conversationLinksPropertyKey,
-  ExportService,
   spaceConfigurationPropertyKey,
-} from "./index.js";
+} from "../shared/app/index.js";
+import { JiraClient } from "../shared/jira/index.js";
+import { type ArtifactRecord, ArtifactWriterService } from "../shared/artifact/index.js";
+import { ExportService } from "./index.js";
 import type { ExportConfig } from "../shared/config/index.js";
 
 const tempPath = async (name: string) => join(await mkdtemp(join(tmpdir(), "ifj-")), name);
@@ -29,12 +29,35 @@ const runExport = (config: ExportConfig, jiraClient: JiraClient["Service"]) =>
       ExportService.layerNoDeps(config).pipe(Layer.provide(exportServiceTestDeps(jiraClient))),
     ),
   );
+const defaultJiraClient: JiraClient["Service"] = {
+  getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
+  searchProjectSpaces: () =>
+    Stream.fromIterable([
+      { key: "ENG", properties: { [spaceConfigurationPropertyKey]: { enabled: true } } },
+    ]),
+  approximateSearchCount: () => Effect.succeed(1),
+  searchWorkItems: () =>
+    Stream.fromIterable([
+      {
+        key: "ENG-1",
+        properties: {
+          [conversationLinksPropertyKey]: { count: 1, conversationIds: ["abc"] },
+        },
+      },
+    ]),
+  writeProjectProperty: () => Effect.void,
+  bulkFetchWorkItems: () => Effect.succeed([]),
+  submitIssuePropertyBulkTask: () =>
+    Effect.succeed("https://example.atlassian.net/rest/api/3/task/task-1"),
+  getTask: () => Effect.succeed({ status: "COMPLETE" }),
+};
 
 describe("export orchestration", () => {
   it.effect("exports through an injected artifact writer service", () =>
     Effect.gen(function* () {
       const writtenRecords: ArtifactRecord[] = [];
       const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
         getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
         searchProjectSpaces: () =>
           Stream.fromIterable([
@@ -108,6 +131,7 @@ describe("export orchestration", () => {
     Effect.gen(function* () {
       const outputPath = yield* Effect.promise(() => tempPath("export.jsonl.gz"));
       const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
         getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
         searchProjectSpaces: () =>
           Stream.fromIterable([
@@ -179,6 +203,7 @@ describe("export orchestration", () => {
       yield* Effect.promise(() => writeFile(outputPath, "existing"));
       yield* Effect.promise(() => writeFile(outputPath1, "existing numbered"));
       const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
         getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
         searchProjectSpaces: () =>
           Stream.fromIterable([
@@ -223,6 +248,7 @@ describe("export orchestration", () => {
     Effect.gen(function* () {
       const outputPath = yield* Effect.promise(() => tempPath("legacy-export.jsonl.gz"));
       const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
         getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
         searchProjectSpaces: () =>
           Stream.fromIterable([
@@ -266,6 +292,7 @@ describe("export orchestration", () => {
     Effect.gen(function* () {
       const outputPath = yield* Effect.promise(() => tempPath("malformed-export.jsonl.gz"));
       const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
         getMyPermissions: () => Effect.succeed({ ADMINISTER: { havePermission: true } }),
         searchProjectSpaces: () =>
           Stream.fromIterable([

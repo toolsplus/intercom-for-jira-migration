@@ -30,7 +30,7 @@ export const normalizeSpaceList = (values: readonly string[]): readonly string[]
     for (const piece of value.split(",")) {
       const space = piece.trim();
       if (space.length > 0) {
-        seen.add(space);
+        seen.add(space.toUpperCase());
       }
     }
   }
