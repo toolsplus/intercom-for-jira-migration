@@ -18,7 +18,8 @@
 ### Target Jira site
 
 - **Administrator user:** This user should have access to all Jira spaces on the target site.
-- **Jira API token:** Follow the [Atlassian documentation on how to create a scoped Jira API token](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/#Create-an-API-token-with-scopes) for the administrator user. Including the following Classic scope:
+- **Jira API token:** Follow the [Atlassian documentation on how to create a scoped Jira API token](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/#Create-an-API-token-with-scopes) for the administrator user. Include the following Classic scopes:
+  - `read:jira-work`
   - `write:jira-work`
 
 If the user has access to both the source and target sites, you can include both source and target scopes in the same API token and use the same token for both import and export.
@@ -37,18 +38,14 @@ pnpm build
 After building, run the CLI with Node from the generated `dist` output:
 
 ```sh
-node dist/src/ifj.js export --source https://example.atlassian.net --user admin@example.com --api-token "$TOKEN"
+node dist/src/ifj.js export --source https://example.atlassian.net --user admin-source@example.com --api-token "$TOKEN_SOURCE"
 node dist/src/ifj.js inspect intercom-for-jira-export.jsonl.gz
+node dist/src/ifj.js import intercom-for-jira-export.jsonl.gz --target https://target.atlassian.net --user admin-target@example.com --api-token "$TOKEN_TARGET"
 ```
 
-You may use environment variables or a .env file to set command configurations. Refer to the command documentation below for available options. 
+You may use environment variables or a .env file to set command configurations. Refer to the command documentation below for available options.
 
 ## Commands
-
-```sh
-ifj export --source https://example.atlassian.net --user admin@example.com --api-token "$TOKEN"
-ifj inspect intercom-for-jira-export.jsonl.gz
-```
 
 ### Export
 
@@ -82,6 +79,43 @@ Environment variables:
 Exports are written as compressed JSON Lines files with the `.jsonl.gz`
 extension.
 
+### Import
+
+`ifj import <artifact>` authenticates with a target Jira Cloud site, verifies
+Jira global admin permission, validates the full compressed JSON Lines artifact,
+and imports selected Jira spaces sequentially.
+
+By default, import applies every space represented in the artifact. Pass
+`--space` one or more times to import only selected spaces. Space keys are
+trimmed, uppercased, deduplicated, and sorted. Selected spaces that are absent
+from the artifact or unavailable on the target site are reported as skipped while
+the import continues for other spaces.
+
+Space configuration properties are written before work-item conversation links
+for each space. Work-item keys from the artifact are resolved to target Jira
+issue IDs at write time and submitted through Jira issue-property bulk tasks in
+batches of up to 100. Empty conversation ID arrays are valid and overwrite the
+target property with no linked conversations.
+
+When an import completes, remember to reconnect imported Jira spaces to Intercom by following
+the setup guide: https://toolspl.us/intercom-for-jira-cloud-setup-connection
+
+Flags:
+
+- `--target URL`: target Jira Cloud URL
+- `--user EMAIL`: Atlassian account email
+- `--api-token TOKEN`: Atlassian API token
+- `--space KEY`: optional target space key. Repeat to select multiple spaces
+- `--json`: print the final summary as JSON
+
+Environment variables:
+
+- `IMPORT_TARGET`
+- `IMPORT_USER`
+- `IMPORT_API_TOKEN`
+- `IMPORT_ARTIFACT_PATH`
+- `IMPORT_SPACES`: comma-separated space keys.
+
 ### Inspect
 
 `ifj inspect <artifact>` validates a `.jsonl.gz` artifact and prints aggregate
@@ -91,6 +125,8 @@ counts:
 ifj inspect migration.jsonl.gz
 ifj inspect migration.jsonl.gz --json
 ```
+
+The artifact path can also be supplied with `INSPECT_ARTIFACT_PATH`.
 
 ## Configuration
 

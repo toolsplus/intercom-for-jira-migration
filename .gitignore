@@ -5,3 +5,4 @@ node_modules/
 .idea
 .env
 intercom-for-jira-export*.jsonl.gz
+.pnpm-store

@@ -15,6 +15,7 @@ type AppErrorCode =
   | "export.malformedLinkProperty"
   | "export.outputExists"
   | "export.outputParentMissing"
+  | "import.bulkTaskFailed"
   | "jira.auth"
   | "jira.malformed"
   | "jira.permission"

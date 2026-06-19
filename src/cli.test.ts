@@ -7,12 +7,10 @@ import { TestConsole } from "effect/testing";
 import { describe, expect, it } from "@effect/vitest";
 
 import { CliService } from "./cli/index.js";
-import {
-  conversationLinksPropertyKey,
-  ExportService,
-  spaceConfigurationPropertyKey,
-} from "./export/index.js";
+import { ExportService } from "./export/index.js";
 import { InspectService } from "./inspect/index.js";
+import { ImportService } from "./import/index.js";
+import { conversationLinksPropertyKey, spaceConfigurationPropertyKey } from "./shared/app/index.js";
 import { JiraClient } from "./shared/jira/index.js";
 import { type ArtifactRecord, ArtifactWriterService } from "./shared/artifact/index.js";
 
@@ -47,6 +45,11 @@ const defaultJiraClient: JiraClient["Service"] = {
     ]),
   approximateSearchCount: () => Effect.succeed(1),
   searchWorkItems: linkedWorkItemStream,
+  writeProjectProperty: () => Effect.void,
+  bulkFetchWorkItems: () => Effect.succeed([]),
+  submitIssuePropertyBulkTask: () =>
+    Effect.succeed("https://example.atlassian.net/rest/api/3/task/task-1"),
+  getTask: () => Effect.succeed({ status: "COMPLETE" }),
 };
 
 const exportServiceLayerFromClient =
@@ -69,8 +72,11 @@ const cliLayerFromExportServiceLayer = <ConfigError = never, ConfigServices = ne
     config: Parameters<typeof ExportService.layer>[0],
   ) => Layer.Layer<ExportService, never, NodeServices.NodeServices>,
   configProviderLayer: Layer.Layer<never, ConfigError, ConfigServices> = Layer.empty,
+  importServiceLayer: (
+    config: Parameters<typeof ImportService.layer>[0],
+  ) => Layer.Layer<ImportService, never, NodeServices.NodeServices> = ImportService.layer,
 ) =>
-  CliService.layerNoDeps(exportServiceLayer).pipe(
+  CliService.layerNoDeps(exportServiceLayer, importServiceLayer).pipe(
     Layer.provideMerge(Layer.mergeAll(TestConsole.layer, cliEnvironmentLayer(configProviderLayer))),
   );
 
@@ -219,4 +225,77 @@ describe("CLI", () => {
       );
     }),
   );
+
+  it.effect("imports through the CLI with target flags and artifact path fallback", () => {
+    const importConfigs: Parameters<typeof ImportService.layer>[0][] = [];
+    const importServiceLayer = (config: Parameters<typeof ImportService.layer>[0]) => {
+      importConfigs.push(config);
+      return Layer.succeed(
+        ImportService,
+        ImportService.of({
+          run: Effect.succeed({
+            source: "https://source.atlassian.net",
+            target: config.target,
+            selectedSpaces: config.spaces,
+            spacesImported: 1,
+            spaceConfigurationsWritten: 1,
+            workItemLinkRecordsImported: 0,
+            conversationIdsImported: 0,
+            warningCount: 0,
+            skippedSpaceCount: 0,
+            failedSpaceConfigurationCount: 0,
+            skippedWorkItemLinkCount: 0,
+            failedWorkItemLinkBatchCount: 0,
+            warnings: [],
+            skippedSpaces: [],
+            failedSpaceConfigurations: [],
+            skippedWorkItemLinks: [],
+            failedWorkItemLinkBatches: [],
+            detailsTruncated: false,
+          }),
+        }),
+      );
+    };
+
+    return Effect.gen(function* () {
+      yield* runCli([
+        "import",
+        "--target",
+        "https://target.atlassian.net/browse/ENG-1",
+        "--user",
+        "admin@example.com",
+        "--api-token",
+        "secret",
+        "--space",
+        "eng",
+        "--space",
+        "OPS",
+      ]);
+
+      const stdout = yield* TestConsole.logLines;
+      expect(stdout.join("\n")).toContain("Import complete");
+      expect(importConfigs).toMatchObject([
+        {
+          target: "https://target.atlassian.net",
+          artifactPath: "from-env.jsonl.gz",
+          spaces: ["ENG", "OPS"],
+          json: false,
+        },
+      ]);
+    }).pipe(
+      Effect.provide(
+        cliLayerFromExportServiceLayer(
+          ExportService.layer,
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({
+              env: {
+                IMPORT_ARTIFACT_PATH: "from-env.jsonl.gz",
+              },
+            }),
+          ),
+          importServiceLayer,
+        ),
+      ),
+    );
+  });
 });

@@ -6,7 +6,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { JiraClient } from "./jira.client.js";
 
 const testCredentials = {
-  source: "https://example.atlassian.net",
+  siteUrl: "https://example.atlassian.net",
   user: "admin@example.com",
   apiToken: Redacted.make("secret"),
 };
@@ -386,6 +386,138 @@ describe("Jira HTTP client", () => {
       const searchUrl = new URL(requests[0]?.url ?? "");
       expect(searchUrl.pathname).toBe("/rest/api/3/search/jql");
       expect(searchUrl.search).toBe("");
+    }),
+  );
+
+  it.effect("submits per-issue property updates and returns the Jira task location", () =>
+    Effect.gen(function* () {
+      const requests: {
+        readonly method: string;
+        readonly url: string;
+        readonly contentType: string | undefined;
+        readonly body: unknown;
+      }[] = [];
+      const httpLayer = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request, url) =>
+          Effect.sync(() => {
+            requests.push({
+              method: request.method,
+              url: url.toString(),
+              contentType: request.headers["content-type"],
+              body: request.body.toJSON(),
+            });
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(null, {
+                status: 303,
+                headers: {
+                  Location: "https://example.atlassian.net/rest/api/3/task/task-1",
+                },
+              }),
+            );
+          }),
+        ),
+      );
+
+      const taskLocation = yield* Effect.gen(function* () {
+        const jiraClient = yield* JiraClient;
+        return yield* jiraClient.submitIssuePropertyBulkTask("example.property", [
+          { issueId: "10001", value: { count: 2, conversationIds: ["a", "b"] } },
+          { issueId: "10002", value: { count: 1, conversationIds: ["c"] } },
+        ]);
+      }).pipe(Effect.provide(jiraClientLayer(httpLayer)));
+
+      expect(taskLocation).toBe("https://example.atlassian.net/rest/api/3/task/task-1");
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.method).toBe("POST");
+      expect(requests[0]?.contentType).toBe("application/json");
+      expect(requests[0]?.body).toMatchObject({
+        _id: "effect/HttpBody",
+        _tag: "Uint8Array",
+        body: JSON.stringify({
+          issues: [
+            {
+              issueID: 10001,
+              properties: {
+                "example.property": { count: 2, conversationIds: ["a", "b"] },
+              },
+            },
+            {
+              issueID: 10002,
+              properties: {
+                "example.property": { count: 1, conversationIds: ["c"] },
+              },
+            },
+          ],
+        }),
+        contentType: "application/json",
+      });
+
+      const writeUrl = new URL(requests[0]?.url ?? "");
+      expect(writeUrl.pathname).toBe("/rest/api/3/issue/properties/multi");
+      expect(writeUrl.search).toBe("");
+    }),
+  );
+
+  it.effect("gets a task from a Jira task location", () =>
+    Effect.gen(function* () {
+      const requests: string[] = [];
+      const httpLayer = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request, url) =>
+          Effect.sync(() => {
+            requests.push(url.toString());
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(JSON.stringify({ status: "COMPLETE" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }),
+            );
+          }),
+        ),
+      );
+
+      const task = yield* Effect.gen(function* () {
+        const jiraClient = yield* JiraClient;
+        return yield* jiraClient.getTask("https://example.atlassian.net/rest/api/3/task/task-1");
+      }).pipe(Effect.provide(jiraClientLayer(httpLayer)));
+
+      expect(task.status).toBe("COMPLETE");
+      expect(requests).toEqual(["https://example.atlassian.net/rest/api/3/task/task-1"]);
+    }),
+  );
+
+  it.effect("rejects cross-origin Jira task locations", () =>
+    Effect.gen(function* () {
+      let requestCount = 0;
+      const httpLayer = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request, url) =>
+          Effect.sync(() => {
+            requestCount += 1;
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response(JSON.stringify({ status: "COMPLETE", url: url.toString() }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }),
+            );
+          }),
+        ),
+      );
+
+      const error = yield* Effect.gen(function* () {
+        const jiraClient = yield* JiraClient;
+        return yield* jiraClient.getTask("https://other.example.net/rest/api/3/task/task-1");
+      }).pipe(Effect.provide(jiraClientLayer(httpLayer)), Effect.flip);
+
+      expect(error).toMatchObject({
+        code: "jira.malformed",
+        message: "Jira returned a task location for another site.",
+      });
+      expect(requestCount).toBe(0);
     }),
   );
 
