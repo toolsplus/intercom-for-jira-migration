@@ -1,5 +1,5 @@
 import type { NodeServices } from "@effect/platform-node";
-import { Array as Arr, Console, Context, Effect, Layer, Result, Stream } from "effect";
+import { Array as Arr, Console, Context, Duration, Effect, Layer, Result, Stream } from "effect";
 
 import { errorMessage } from "../errors.js";
 import type { AppError } from "../errors.js";
@@ -135,57 +135,22 @@ const skippedMismatchedWorkItem = (
 const writeLinkBatch = (
   spaceKey: string,
   batchNumber: number,
+  totalBatches: number,
   records: readonly WorkItemConversationLinksRecord[],
   jiraService: ImportJiraService["Service"],
   state: MutableImportState,
 ): Effect.Effect<void> =>
-  Effect.gen(function* () {
-    const resolved = yield* jiraService.resolveWorkItems(
-      records.map((record) => record.workItemKey),
-    );
-    const byRequestedKey = new Map(resolved.map((item) => [item.requestedKey, item]));
-    const conversationLinkPropertyUpdates = Arr.filterMap(records, (record) => {
-      const workItem = byRequestedKey.get(record.workItemKey);
-      if (workItem === undefined) {
-        pushDetail(state.skippedWorkItemLinks, skippedMissingWorkItem(record), state);
-        return Result.failVoid;
-      } else if (workItem.key !== record.workItemKey) {
-        pushDetail(
-          state.skippedWorkItemLinks,
-          skippedMismatchedWorkItem(record, workItem.key),
-          state,
-        );
-        return Result.failVoid;
-      }
-
-      const conversationIds = Arr.dedupe(record.conversationIds);
-      return Result.succeed({
-        issueId: workItem.id,
-        value: {
-          count: conversationIds.length,
-          conversationIds,
-        },
-      } satisfies JiraIssuePropertyUpdate);
-    });
-
-    if (conversationLinkPropertyUpdates.length === 0) {
-      return;
-    }
-
-    yield* jiraService
-      .writeWorkItemConversationLinks(spaceKey, conversationLinkPropertyUpdates)
-      .pipe(
-        Effect.tap(() =>
-          Effect.sync(() => {
-            state.workItemLinkRecordsImported += conversationLinkPropertyUpdates.length;
-            state.conversationIdsImported += Arr.reduce(
-              conversationLinkPropertyUpdates,
-              0,
-              (sum, propertyUpdate) => sum + propertyUpdate.value.count,
-            );
-          }),
-        ),
-        Effect.catch((error) =>
+  Effect.suspend(() => {
+    const batchStartedAt = Date.now();
+    const failedBatch = (error: unknown) =>
+      Console.error(
+        `Import batch ${String(batchNumber)}/${String(
+          totalBatches,
+        )} for space ${spaceKey}: failed after ${Duration.format(
+          Duration.millis(Date.now() - batchStartedAt),
+        )}: ${errorMessage(error)}.`,
+      ).pipe(
+        Effect.andThen(
           Effect.sync(() => {
             pushDetail(
               state.failedWorkItemLinkBatches,
@@ -195,28 +160,92 @@ const writeLinkBatch = (
           }),
         ),
       );
-  }).pipe(
-    Effect.catch((error) =>
-      Effect.sync(() => {
-        pushDetail(
-          state.failedWorkItemLinkBatches,
-          { spaceKey, batchNumber, reason: errorMessage(error) },
-          state,
+
+    return Effect.gen(function* () {
+      const resolved = yield* jiraService.resolveWorkItems(
+        records.map((record) => record.workItemKey),
+      );
+      const byRequestedKey = new Map(resolved.map((item) => [item.requestedKey, item]));
+      const conversationLinkPropertyUpdates = Arr.filterMap(records, (record) => {
+        const workItem = byRequestedKey.get(record.workItemKey);
+        if (workItem === undefined) {
+          pushDetail(state.skippedWorkItemLinks, skippedMissingWorkItem(record), state);
+          return Result.failVoid;
+        } else if (workItem.key !== record.workItemKey) {
+          pushDetail(
+            state.skippedWorkItemLinks,
+            skippedMismatchedWorkItem(record, workItem.key),
+            state,
+          );
+          return Result.failVoid;
+        }
+
+        const conversationIds = Arr.dedupe(record.conversationIds);
+        return Result.succeed({
+          issueId: workItem.id,
+          value: {
+            count: conversationIds.length,
+            conversationIds,
+          },
+        } satisfies JiraIssuePropertyUpdate);
+      });
+
+      if (conversationLinkPropertyUpdates.length === 0) {
+        yield* Console.error(
+          `Import batch ${String(batchNumber)}/${String(
+            totalBatches,
+          )} for space ${spaceKey}: skipped records=${String(records.length)} in ${Duration.format(
+            Duration.millis(Date.now() - batchStartedAt),
+          )}; no Jira write needed.`,
         );
-      }),
-    ),
-  );
+        return;
+      }
+
+      yield* jiraService
+        .writeWorkItemConversationLinks(spaceKey, conversationLinkPropertyUpdates)
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              state.workItemLinkRecordsImported += conversationLinkPropertyUpdates.length;
+              state.conversationIdsImported += Arr.reduce(
+                conversationLinkPropertyUpdates,
+                0,
+                (sum, propertyUpdate) => sum + propertyUpdate.value.count,
+              );
+            }),
+          ),
+          Effect.tap(() =>
+            Console.error(
+              `Import batch ${String(batchNumber)}/${String(
+                totalBatches,
+              )} for space ${spaceKey}: importedRecords=${String(
+                conversationLinkPropertyUpdates.length,
+              )}, records=${String(records.length)}, conversationIds=${String(
+                Arr.reduce(
+                  conversationLinkPropertyUpdates,
+                  0,
+                  (sum, propertyUpdate) => sum + propertyUpdate.value.count,
+                ),
+              )} in ${Duration.format(Duration.millis(Date.now() - batchStartedAt))}.`,
+            ),
+          ),
+        );
+    }).pipe(Effect.catch(failedBatch));
+  });
 
 const applyWorkItemLinks = (
   space: ImportSpacePlan,
   jiraService: ImportJiraService["Service"],
   state: MutableImportState,
-): Effect.Effect<void> =>
-  Effect.forEach(
-    Arr.chunksOf(space.workItemLinkRecords, workItemLinkBatchSize),
-    (batch, index) => writeLinkBatch(space.spaceKey, index + 1, batch, jiraService, state),
+): Effect.Effect<void> => {
+  const batches = Arr.chunksOf(space.workItemLinkRecords, workItemLinkBatchSize);
+  return Effect.forEach(
+    batches,
+    (batch, index) =>
+      writeLinkBatch(space.spaceKey, index + 1, batches.length, batch, jiraService, state),
     { discard: true },
   );
+};
 
 const applySpace = (
   space: ImportSpacePlan,
@@ -224,7 +253,14 @@ const applySpace = (
   state: MutableImportState,
 ): Effect.Effect<void, AppError> =>
   Effect.gen(function* () {
-    yield* Console.error(`Importing space ${space.spaceKey}`);
+    const workItemLinkBatches = Math.ceil(space.workItemLinkRecords.length / workItemLinkBatchSize);
+    yield* Console.error(
+      `Importing space ${space.spaceKey}: configurationRecords=${String(
+        space.configurationRecords.length,
+      )}, workItemLinkRecords=${String(space.workItemLinkRecords.length)}, batches=${String(
+        workItemLinkBatches,
+      )}, batchSize=${String(workItemLinkBatchSize)}.`,
+    );
     const available = yield* jiraService.targetSpaceAvailable(space.spaceKey);
     if (!available) {
       pushDetail(state.skippedSpaces, unavailableTargetSpace(space.spaceKey), state);

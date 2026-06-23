@@ -1,6 +1,6 @@
 import { Effect, Fiber, Layer, Redacted, Stream } from "effect";
 import { HttpClient, HttpClientError, HttpClientResponse } from "effect/unstable/http";
-import { TestClock } from "effect/testing";
+import { TestClock, TestConsole } from "effect/testing";
 import { describe, expect, it } from "@effect/vitest";
 
 import { JiraClient } from "./jira.client.js";
@@ -103,7 +103,7 @@ describe("Jira HTTP client", () => {
       yield* TestClock.adjust("250 millis");
       yield* Fiber.join(fiber);
       expect(requestCount).toBe(2);
-    }),
+    }).pipe(Effect.provide(TestConsole.layer)),
   );
 
   it.effect("retries retryable Jira status responses before decoding Jira responses", () =>
@@ -143,7 +143,65 @@ describe("Jira HTTP client", () => {
       yield* TestClock.adjust("250 millis");
       yield* Fiber.join(fiber);
       expect(requestCount).toBe(2);
-    }),
+      const stderr = (yield* TestConsole.errorLines).map(String).join("\n");
+      expect(stderr).toContain(
+        "Retryable Jira request failure: Retrying GET /rest/api/3/mypermissions?permissions=ADMINISTER in 250ms (attempt 2/4).",
+      );
+    }).pipe(Effect.provide(TestConsole.layer)),
+  );
+
+  it.effect("logs Jira rate-limit headers when retrying 429 responses", () =>
+    Effect.gen(function* () {
+      let requestCount = 0;
+      const httpLayer = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make((request) =>
+          Effect.sync(() => {
+            requestCount += 1;
+            return HttpClientResponse.fromWeb(
+              request,
+              requestCount === 1
+                ? new Response("Rate limited", {
+                    status: 429,
+                    headers: {
+                      "Retry-After": "2",
+                      "X-RateLimit-Limit": "500",
+                      "X-RateLimit-Remaining": "0",
+                      "X-RateLimit-NearLimit": "true",
+                      "RateLimit-Reason": "jira-burst-based",
+                    },
+                  })
+                : new Response(
+                    JSON.stringify({
+                      permissions: {
+                        ADMINISTER: {
+                          havePermission: true,
+                        },
+                      },
+                    }),
+                    { status: 200, headers: { "Content-Type": "application/json" } },
+                  ),
+            );
+          }),
+        ),
+      );
+
+      const fiber = yield* Effect.gen(function* () {
+        const jiraClient = yield* JiraClient;
+        yield* jiraClient.getMyPermissions(["ADMINISTER"]);
+      }).pipe(Effect.provide(jiraClientLayer(httpLayer)), Effect.forkChild);
+      yield* Effect.yieldNow;
+      expect(requestCount).toBe(1);
+
+      yield* TestClock.adjust("2 seconds");
+      yield* Fiber.join(fiber);
+      expect(requestCount).toBe(2);
+
+      const stderr = (yield* TestConsole.errorLines).map(String).join("\n");
+      expect(stderr).toContain(
+        "Jira rate limit: Retrying GET /rest/api/3/mypermissions?permissions=ADMINISTER in 2s (attempt 2/4); rateLimit limit=500, remaining=0, nearLimit=true, reason=jira-burst-based, retryAfter=2s.",
+      );
+    }).pipe(Effect.provide(TestConsole.layer)),
   );
 
   it.effect("searches projects with query params and properties", () =>

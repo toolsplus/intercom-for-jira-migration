@@ -288,6 +288,47 @@ describe("export orchestration", () => {
     }).pipe(Effect.provide(TestConsole.layer)),
   );
 
+  it.effect("logs export batches and per-space totals", () =>
+    Effect.gen(function* () {
+      const outputPath = yield* Effect.promise(() => tempPath("batched-export.jsonl.gz"));
+      const jiraClient: JiraClient["Service"] = {
+        ...defaultJiraClient,
+        searchWorkItems: () =>
+          Stream.fromIterable(
+            Array.from({ length: 101 }, (_, index) => ({
+              key: `ENG-${String(index + 1)}`,
+              properties: {
+                [conversationLinksPropertyKey]: {
+                  count: 1,
+                  conversationIds: [`conversation-${String(index + 1)}`],
+                },
+              },
+            })),
+          ),
+      };
+
+      const summary = yield* runExport(
+        {
+          source: "https://example.atlassian.net",
+          user: "admin@example.com",
+          apiToken: Redacted.make("secret"),
+          out: outputPath,
+          spaces: [],
+          json: false,
+        },
+        jiraClient,
+      );
+
+      const stderr = (yield* TestConsole.errorLines).map(String).join("\n");
+      expect(summary.workItemConversationLinkRecords).toBe(101);
+      expect(stderr).toContain("Export batch 1 for space ENG: records=100, conversationIds=100 in");
+      expect(stderr).toContain("Export batch 2 for space ENG: records=1, conversationIds=1 in");
+      expect(stderr).toContain(
+        "Finished exporting space ENG: configurationRecords=1, workItemLinkRecords=101, conversationIds=101 in",
+      );
+    }).pipe(Effect.provide(TestConsole.layer)),
+  );
+
   it.effect("fails and cleans up when a link property is malformed", () =>
     Effect.gen(function* () {
       const outputPath = yield* Effect.promise(() => tempPath("malformed-export.jsonl.gz"));

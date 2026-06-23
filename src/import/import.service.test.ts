@@ -253,6 +253,34 @@ describe("import orchestration", () => {
     }),
   );
 
+  it.effect("logs work item link batch progress", () =>
+    Effect.gen(function* () {
+      const jiraLayer = Layer.succeed(
+        ImportJiraService,
+        ImportJiraService.of(defaultImportJiraService),
+      );
+
+      yield* ImportService.use((service) => service.run).pipe(
+        Effect.provide(
+          ImportService.layerNoDeps(config).pipe(
+            Layer.provide(Layer.mergeAll(readerLayerFromRecords(linkRecords(101)), jiraLayer)),
+          ),
+        ),
+      );
+
+      const stderr = (yield* TestConsole.errorLines).map(String).join("\n");
+      expect(stderr).toContain(
+        "Importing space ENG: configurationRecords=0, workItemLinkRecords=101, batches=2, batchSize=100.",
+      );
+      expect(stderr).toContain(
+        "Import batch 1/2 for space ENG: importedRecords=100, records=100, conversationIds=100 in",
+      );
+      expect(stderr).toContain(
+        "Import batch 2/2 for space ENG: importedRecords=1, records=1, conversationIds=1 in",
+      );
+    }).pipe(Effect.provide(TestConsole.layer)),
+  );
+
   it.effect("propagates target space lookup errors instead of recording skipped spaces", () =>
     Effect.gen(function* () {
       const error = yield* runImport(records, {

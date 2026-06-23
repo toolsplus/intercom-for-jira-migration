@@ -1,4 +1,4 @@
-import { Cause, Duration, Effect, Option, Schedule, Schema } from "effect";
+import { Cause, Console, Duration, Effect, Option, Schedule, Schema } from "effect";
 import { Headers } from "effect/unstable/http";
 import type { HttpClientResponse } from "effect/unstable/http";
 
@@ -28,6 +28,7 @@ const rateLimitHeaders = (headers: ResponseHeaders): Record<string, string> => {
     const normalized = key.toLowerCase();
     if (
       normalized === "retry-after" ||
+      normalized === "beta-retry-after" ||
       normalized === "ratelimit-reason" ||
       normalized.startsWith("x-ratelimit") ||
       normalized.startsWith("x-beta-ratelimit") ||
@@ -39,8 +40,68 @@ const rateLimitHeaders = (headers: ResponseHeaders): Record<string, string> => {
   return allowed;
 };
 
+const firstHeader = (headers: ResponseHeaders, names: readonly string[]): string | undefined => {
+  for (const name of names) {
+    const value = Option.getOrUndefined(Headers.get(headers, name));
+    if (value !== undefined && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+};
+
+const formatRateLimitHeaders = (headers: ResponseHeaders): string => {
+  const parts: string[] = [];
+  const limit = firstHeader(headers, ["x-ratelimit-limit", "x-beta-ratelimit-limit"]);
+  const remaining = firstHeader(headers, ["x-ratelimit-remaining", "x-beta-ratelimit-remaining"]);
+  const nearLimit = firstHeader(headers, ["x-ratelimit-nearlimit", "x-beta-ratelimit-nearlimit"]);
+  const reason = firstHeader(headers, ["ratelimit-reason", "x-beta-ratelimit-reason"]);
+  const retryAfter = firstHeader(headers, ["retry-after", "beta-retry-after"]);
+
+  if (limit !== undefined) {
+    parts.push(`limit=${limit}`);
+  }
+  if (remaining !== undefined) {
+    parts.push(`remaining=${remaining}`);
+  }
+  if (nearLimit?.toLowerCase() === "true") {
+    parts.push("nearLimit=true");
+  }
+  if (reason !== undefined) {
+    parts.push(`reason=${reason}`);
+  }
+  if (retryAfter !== undefined) {
+    parts.push(`retryAfter=${retryAfter}${/^\d+$/u.test(retryAfter) ? "s" : ""}`);
+  }
+
+  return parts.length === 0 ? "" : `; rateLimit ${parts.join(", ")}`;
+};
+
+const contextText = (context: Record<string, unknown>, key: string, fallback: string): string => {
+  const value = context[key];
+  return typeof value === "string" ? value : fallback;
+};
+
+const logRateLimitWarning = (
+  response: HttpClientResponse.HttpClientResponse,
+  context: Record<string, unknown>,
+): Effect.Effect<void> =>
+  response.status < 400 &&
+  firstHeader(response.headers, [
+    "x-ratelimit-nearlimit",
+    "x-beta-ratelimit-nearlimit",
+  ])?.toLowerCase() === "true"
+    ? Console.error(
+        `Jira rate limit warning on ${contextText(context, "method", "request")} ${contextText(
+          context,
+          "path",
+          "",
+        )}${formatRateLimitHeaders(response.headers)}.`,
+      )
+    : Effect.void;
+
 const retryAfterMs = (headers: ResponseHeaders, nowMillis: number): number | undefined => {
-  const retryAfter = Option.getOrUndefined(Headers.get(headers, "retry-after"));
+  const retryAfter = firstHeader(headers, ["retry-after", "beta-retry-after"]);
   if (retryAfter === undefined) {
     return undefined;
   }
@@ -79,6 +140,24 @@ const retryableErrorHeaders = (error: AppError): ResponseHeaders => {
 
 const isRetryableError = (error: AppError): boolean =>
   error.code === "jira.transient" && error.context["retryable"] === true;
+
+const retryLogLine = (
+  context: Record<string, unknown>,
+  error: AppError,
+  delayMillis: number,
+  attempt: number,
+  policy: RetryPolicy,
+): string => {
+  const status = error.context["status"];
+  const retryKind = status === 429 ? "Jira rate limit" : "Retryable Jira request failure";
+  return `${retryKind}: Retrying ${contextText(context, "method", "request")} ${contextText(
+    context,
+    "path",
+    "",
+  )} in ${Duration.format(Duration.millis(delayMillis))} (attempt ${String(attempt + 1)}/${String(
+    policy.maxAttempts,
+  )})${formatRateLimitHeaders(retryableErrorHeaders(error))}.`;
+};
 
 export const jiraStatusFailure = (
   response: HttpClientResponse.HttpClientResponse,
@@ -146,22 +225,31 @@ export const sendWithRetry = <A>(
   request.pipe(
     Effect.timeout(policy.requestTimeoutMillis),
     Effect.mapError((cause) => transientRequestError(cause, context)),
-    Effect.flatMap(handleResponse),
+    Effect.flatMap((response) =>
+      logRateLimitWarning(response, context).pipe(Effect.andThen(handleResponse(response))),
+    ),
     Effect.retry(
       Schedule.fromStepWithMetadata<AppError, number, never, Cause.Done<number>, never, never>(
         Effect.succeed((metadata) =>
           isRetryableError(metadata.input) && metadata.attempt < policy.maxAttempts
-            ? Effect.succeed([
-                metadata.attempt,
-                Duration.millis(
-                  retryDelay(
-                    policy,
-                    retryableErrorHeaders(metadata.input),
-                    metadata.attempt,
-                    metadata.now,
+            ? (() => {
+                const delayMillis = retryDelay(
+                  policy,
+                  retryableErrorHeaders(metadata.input),
+                  metadata.attempt,
+                  metadata.now,
+                );
+                return Console.error(
+                  retryLogLine(context, metadata.input, delayMillis, metadata.attempt, policy),
+                ).pipe(
+                  Effect.andThen(
+                    Effect.succeed([metadata.attempt, Duration.millis(delayMillis)] as [
+                      number,
+                      Duration.Duration,
+                    ]),
                   ),
-                ),
-              ])
+                );
+              })()
             : Cause.done(metadata.attempt),
         ),
       ),

@@ -1,9 +1,24 @@
-import { Console, Context, Effect, Inspectable, Layer, Option, Schema, Stream } from "effect";
+import {
+  Console,
+  Context,
+  Duration,
+  Effect,
+  Inspectable,
+  Layer,
+  Option,
+  Result,
+  Schema,
+  Stream,
+} from "effect";
 
 import { AppError, errorMessage } from "../errors.js";
 import type { ExportConfig } from "../shared/config/index.js";
 import { JiraClient } from "../shared/jira/index.js";
-import { type ArtifactRecord, ArtifactWriterService } from "../shared/artifact/index.js";
+import {
+  type ArtifactRecord,
+  ArtifactWriterService,
+  type WorkItemConversationLinksRecord,
+} from "../shared/artifact/index.js";
 import {
   ConversationLinkMigrationValue,
   LegacyConversationLinkPropertyValue,
@@ -18,6 +33,8 @@ const emptyCounts = (): MutableCounts => ({
   workItemConversationLinkRecords: 0,
   conversationIds: 0,
 });
+
+const workItemLinkExportBatchSize = 100;
 
 const decodeJson = (value: unknown): Effect.Effect<Option.Option<typeof Schema.Json.Type>> =>
   Schema.decodeUnknownEffect(Schema.Json)(value).pipe(Effect.option);
@@ -154,21 +171,36 @@ const exportSpaceRecords = (
 ): Stream.Stream<ArtifactRecord, AppError> =>
   Stream.unwrap(
     Effect.gen(function* () {
+      const spaceStartedAt = Date.now();
       yield* Console.error(`Exporting space ${space.key}`);
       counts.spacesProcessed += 1;
       const beforeConfig = counts.spaceConfigurationRecords;
       const beforeLinks = counts.workItemConversationLinkRecords;
+      const beforeConversationIds = counts.conversationIds;
 
       const records = exportSpaceConfigurationRecord(space, warnings, counts).pipe(
         Stream.concat(exportSpaceLinkRecords(space.key, jiraService, warnings, counts)),
         Stream.concat(
           Stream.fromEffect(
             Effect.suspend(() =>
-              config.spaces.length > 0 &&
+              (config.spaces.length > 0 &&
               beforeConfig === counts.spaceConfigurationRecords &&
               beforeLinks === counts.workItemConversationLinkRecords
                 ? warn(warnings, "EMPTY_EXPLICIT_SPACE", { spaceKey: space.key })
-                : Effect.void,
+                : Effect.void
+              ).pipe(
+                Effect.andThen(
+                  Console.error(
+                    `Finished exporting space ${space.key}: configurationRecords=${String(
+                      counts.spaceConfigurationRecords - beforeConfig,
+                    )}, workItemLinkRecords=${String(
+                      counts.workItemConversationLinkRecords - beforeLinks,
+                    )}, conversationIds=${String(
+                      counts.conversationIds - beforeConversationIds,
+                    )} in ${Duration.format(Duration.millis(Date.now() - spaceStartedAt))}.`,
+                  ),
+                ),
+              ),
             ),
           ).pipe(Stream.drain),
         ),
@@ -234,56 +266,73 @@ const exportSpaceLinkRecords = (
   jiraService: JiraService["Service"],
   warnings: WarningCollector,
   counts: MutableCounts,
-): Stream.Stream<ArtifactRecord, AppError> =>
-  jiraService.searchWorkItemConversationLinks(spaceKey).pipe(
-    Stream.mapEffect((hit) =>
-      Effect.gen(function* () {
-        const maybeLinkProperty = yield* decodeLinkProperty(hit.propertyValue).pipe(
-          Effect.matchEffect({
-            onFailure: (failure) =>
-              Effect.gen(function* () {
-                yield* warnMalformedLinkProperty(warnings, spaceKey, hit.key, failure);
-                return yield* new AppError(
-                  "export.malformedLinkProperty",
-                  `Malformed conversation-link property on work item ${spaceKey}/${hit.key}. Unable to decode as current or legacy format.`,
-                  {
-                    context: {
-                      spaceKey,
-                      workItemKey: hit.key,
-                      currentSchemaError: Inspectable.toStringUnknown(failure.currentSchemaError),
-                      legacySchemaError: Inspectable.toStringUnknown(failure.legacySchemaError),
+): Stream.Stream<WorkItemConversationLinksRecord, AppError> =>
+  Stream.unwrap(
+    Effect.sync(() => {
+      let batchNumber = 0;
+      let batchStartedAt = Date.now();
+
+      return jiraService.searchWorkItemConversationLinks(spaceKey).pipe(
+        Stream.filterMapEffect((hit) =>
+          Effect.gen(function* () {
+            const linkProperty = yield* decodeLinkProperty(hit.propertyValue).pipe(
+              Effect.catch((failure) =>
+                Effect.gen(function* () {
+                  yield* warnMalformedLinkProperty(warnings, spaceKey, hit.key, failure);
+                  return yield* new AppError(
+                    "export.malformedLinkProperty",
+                    `Malformed conversation-link property on work item ${spaceKey}/${hit.key}. Unable to decode as current or legacy format.`,
+                    {
+                      context: {
+                        spaceKey,
+                        workItemKey: hit.key,
+                        currentSchemaError: Inspectable.toStringUnknown(failure.currentSchemaError),
+                        legacySchemaError: Inspectable.toStringUnknown(failure.legacySchemaError),
+                      },
+                      cause: failure,
                     },
-                    cause: failure,
-                  },
-                );
-              }),
-            onSuccess: (linkProperty) => Effect.succeed(Option.some(linkProperty)),
+                  );
+                }),
+              ),
+            );
+            if (linkProperty.conversationIds.size === 0) {
+              yield* warn(warnings, "EMPTY_LINK_PROPERTY", {
+                spaceKey,
+                workItemKey: hit.key,
+              });
+              return Result.failVoid;
+            }
+            const conversationIds = [...linkProperty.conversationIds];
+            counts.workItemConversationLinkRecords += 1;
+            counts.conversationIds += conversationIds.length;
+            return Result.succeed({
+              type: "workItemConversationLinks",
+              spaceKey,
+              workItemKey: hit.key,
+              conversationIds,
+            } satisfies WorkItemConversationLinksRecord);
           }),
-        );
-        if (Option.isNone(maybeLinkProperty)) {
-          return Option.none<ArtifactRecord>();
-        }
-        if (maybeLinkProperty.value.conversationIds.size === 0) {
-          yield* warn(warnings, "EMPTY_LINK_PROPERTY", {
-            spaceKey,
-            workItemKey: hit.key,
-          });
-          return Option.none<ArtifactRecord>();
-        }
-        const conversationIds = [...maybeLinkProperty.value.conversationIds];
-        counts.workItemConversationLinkRecords += 1;
-        counts.conversationIds += conversationIds.length;
-        return Option.some<ArtifactRecord>({
-          type: "workItemConversationLinks",
-          spaceKey,
-          workItemKey: hit.key,
-          conversationIds,
-        });
-      }),
-    ),
-    Stream.flatMap((record) =>
-      Option.isSome(record) ? Stream.succeed(record.value) : Stream.empty,
-    ),
+        ),
+        Stream.grouped(workItemLinkExportBatchSize),
+        Stream.mapEffect((batch) =>
+          Console.error(
+            `Export batch ${String(++batchNumber)} for space ${spaceKey}: records=${String(
+              batch.length,
+            )}, conversationIds=${String(
+              batch.reduce((sum, record) => sum + record.conversationIds.length, 0),
+            )} in ${Duration.format(Duration.millis(Date.now() - batchStartedAt))}.`,
+          ).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                batchStartedAt = Date.now();
+              }),
+            ),
+            Effect.as(batch),
+          ),
+        ),
+        Stream.flatMap((batch) => Stream.fromIterable(batch)),
+      );
+    }),
   );
 
 export class ExportService extends Context.Service<
